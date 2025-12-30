@@ -1,0 +1,89 @@
+.\" -*- mode: troff; coding: utf-8 -*-
+.\"*******************************************************************
+.\"
+.\" This file was extracted from hal/components/kneekins.comp using halcompile.g.
+.\" Modify the source file.
+.\"
+.\"*******************************************************************
+
+.TH USERKINS "9" "2025-12-27" "LinuxCNC Documentation" "HAL Component"
+.SH NAME
+
+userkins \- Template for user-built kinematics
+.SH SYNOPSIS
+.HP
+.B loadrt userkins [count=\fIN\fB|names=\fIname1\fB[,\fIname2...\fB]]
+.SH DESCRIPTION
+
+
+.if \n[.g] .mso www.tmac
+
+The userkins.comp file is a template for creating
+kinematics that can be user-built using halcompile.
+
+The unmodified userkins component can be used
+as a kinematics file for a machine with identity
+kinematics for an xyz machine employing 3 joints
+(motors).
+
+\fBUSAGE:\fR
+
+  1) Copy the userkins.comp file to a user-owned
+     directory (\fBmydir\fR).
+
+     Note: The userkins.comp file can be downloaded from:
+.URL https://github.com/LinuxCNC/linuxcnc/raw/2.8/src/hal/components/userkins.comp
+     where '2.8' is the branch name (use 'master' for
+     the master branch)
+
+     For a RIP (run-in-place) build, the file is located in
+     the git tree as:
+       src/hal/components/userkins.comp
+
+  2) Edit the functions kinematicsForward() and
+     kinematicsInverse() as required
+  3) If required, add hal pins following examples in
+     the template code
+  4) Build and install the component using halcompile:
+     $ cd \fBmydir\fR
+     $ [sudo] halcompile --install userkins.comp
+     # Note:
+     #      sudo is required when using a deb install
+     #      sudo is \fBnot\fR required for run-in-place builds
+     # $ man halcompile for more info
+  5) Specify userkins in an ini file as:
+     \fB[KINS]\fR
+     \fBKINEMATICS=userkins\fR
+     \fBJOINTS=3\fR
+     # the number of JOINTS must agree with the
+     # number of joints used in your modified userkins.comp
+  6) Note: the manpage for userkins is not updated by
+     halcompile --install
+  7) To use a different component name, rename the file
+     (example mykins.comp) and change all instances of
+     'userkins' to 'mykins'
+
+\fBNOTES:\fR
+  1  The \fBfpin\fR pin is included to satisfy the requirements of
+     the halcompile utility but it is not accessible to kinematics
+     functions.
+
+  2  Hal pins and parameters needed in kinematics functions
+     (kinematicsForward(), kinematicsInverse()) must
+     be setup in a function (\fBuserkins_setup()\fR) invoked
+     by the initial motion module call to kinematicsType().
+
+.SH FUNCTIONS
+.TP
+\fBuserkins.\fIN\fB.fdemo\fR (requires a floating-point thread)
+
+.SH PINS
+.TP
+.B userkins.\fIN\fB.fpin\fR s32 out \fR(default: \fI0\fR)
+pin to demonstrate use of a conventional (non-kinematics) function fdemo
+.SH AUTHOR
+
+Dewey Garrett
+.SH LICENSE
+
+GPL

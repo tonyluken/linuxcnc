@@ -1,0 +1,391 @@
+component mesa_pktuart_at715 "PktUART interface to Mitutoyo AT715 Absolute Linear Scale";
+
+description 
+"""
+This component uses the Mesa PktUART to interface with a Mitutoyo AT715 Absolute
+Linear Scale. It may work with other models/brands if they follow the same
+protocol: This component sends an absolute mesurement request command to the AT715 every 
+50 ms. The command is simply a single byte (0x01). The AT715 responds to the command
+by sending a 6 byte frame containing the absolute position. The bit rate is 19200 bits
+per second, the bytes are sent with 8N1 encoding (1 start bit, 8 data bits, no
+parity bit, and one stop bit. The first byte in the response is 0x00, the next 4 bytes
+(sent least significant byte first) represent the absolute position with an lsb
+of 0.5um, and the last byte is the sum of the prior 5 bytes.
+
+This component exports four HAL pins: the first, absPosition, is the absolute
+position with the desired scaling and offset applied; the second, valid, is a flag
+indicating the position is valid; the third, update, is a flag indicating the
+position has changed by at least the changeThreshold; and the forth, error, is a flag
+indicating the Mitutoyo AT715 is reporting an error.
+
+Parameters are provided to scale, offset, and round the raw position reported by the AT715
+such that the output position is given by:
+
+	absPosition = precision * round( (scaling * rawPosition + offset) / precision )
+	
+	where precision = pow(10, -digits)
+
+A fourth parameter is provided to set the changeThreshhold.
+
+This module uses the names= mode of loadrt declaration to specifiy which PktUART
+instances to enable. A check is included to ensure that the count= option is
+not used instead. The component should be loaded something like this:
+
+loadrt mesa_pktuart_at715 names=hm2_[MESA](BOARD).0.pktuart.0
+addf hm2_[MESA](BOARD).0.pktuart.0.receive servo-thread
+
+""";
+
+author "Tony Luken";
+license "GPL";
+
+include <unistd.h>;
+include <math.h>;
+include "hal/drivers/mesa-hostmot2/hostmot2-serial.h";
+include "hal/drivers/mesa-hostmot2/hostmot2.h";
+
+pin out bit valid  "Indicates the absolute position is valid";
+pin out bit update "Pulses high to indicate the absolute position has changed";
+pin out float absPosition "The absolute position";
+pin out bit error  "Indicates the Mitutoyo AT715 is reporting an error";
+
+param rw float scaling = 5e-4 "Signed scale factor to be applied to the raw absolute position, use +/-1.968503937e-5 to obtain inches or +/-5e-4 to obtain millimeters";
+param rw float offset = 0.0 "Offset to be applied to the scaled position";
+param rw float digits = 4 "The number of digits to the right of the decimal point to output";
+param rw float changeThreshold = 0.0005 "Threshold to determine when the scaled position has changed";
+
+option extra_setup yes;
+
+function receive fp;
+
+;;
+
+
+
+#define BAUDRATE 			(19200)
+#define MAX_FRAMES 			(16)
+#define REQUEST_PERIOD_NS 	(50000000) //50ms is the fastest cycle time that the AT715 supports
+
+#define STARTING 				(0)
+#define SEND_COMMAND 			(1)
+#define WAITING_FOR_DATA 		(2)
+#define WAITING_FOR_DATA_FRAME 	(3)
+#define FETCH_FRAME_DATA 		(4)
+#define PARSE_DATA 				(5)
+#define ERROR_RESET 			(6)
+
+
+#define READ_ABS_DATA_CMD         (0x01)
+#define READ_ERROR_DETAIL_CMD     (0x19)
+#define RESET_SOFTWARE_CMD        (0x95)
+
+char *name; // PktUART name
+
+unsigned char readCmd[1];
+rtapi_u8 send_num_frames = 1;
+rtapi_u16 send_frame_sizes[] = {(rtapi_u16) 1};
+float precision = 0.1;
+
+/* This uses the RTAPI_MP_ARRAY_STRING macro to load the list of PktUART channels
+into an array. This is copied into the *name string of each */
+
+char *pktuart_chans[4] = {0,};
+RTAPI_MP_ARRAY_STRING(pktuart_chans, 2, "PktUART Channel names");
+
+rtapi_u8 getByte(int index, rtapi_u32 *data) {
+	return (data[index/4] >> (8*(index % 4))) & 0xFF;
+}
+
+void dumpFrameData(rtapi_u32 *data, int frameSize) {
+	rtapi_print("Frame data: ");
+	for (int i=0; i<frameSize; i++) {
+		rtapi_print("0x%02x ", getByte(i, data));
+	}
+	rtapi_print("\n");
+}
+
+int checkForBadFrameSize(rtapi_u32 *data, int actualFrameSize, int expectedFrameSize) {
+	if (actualFrameSize != expectedFrameSize) {
+		rtapi_print_msg(RTAPI_MSG_ERR, "%s Expected Mitutoyo AT715 frame size to be %d bytes but received %d bytes\n", name, expectedFrameSize, actualFrameSize);
+		dumpFrameData(data, actualFrameSize);
+		return -1;
+	}
+	return 0;
+}
+
+int checkSumOk(rtapi_u32 *data, int frameSize) {
+	rtapi_u8 sum = 0;
+	for (int i=0; i<frameSize-1; i++) {
+		sum = sum + getByte(i, data);
+	}
+	rtapi_u8 expectedSum = getByte(frameSize-1, data);
+	if (sum != expectedSum) {
+		rtapi_print_msg(RTAPI_MSG_ERR, "%s Expected Mitutoyo AT715 frame checksum to be 0x%02x but computed 0x%02x\n", name, expectedSum, sum);
+		dumpFrameData(data, frameSize);
+		return 0;
+	}
+	return 1;
+}
+
+
+
+FUNCTION(receive) {
+	static rtapi_u32 frame_sizes[MAX_FRAMES];
+	static rtapi_u32 rxdata[256];
+	static int frame_index;
+	
+	static rtapi_u32 rxStatus;
+	
+	static int state = STARTING;
+	static int waitCount = 0;
+	static float oldAbsPosition = 0;
+	static long int delay = REQUEST_PERIOD_NS;
+	
+	switch (state) {
+		case STARTING:
+			valid = 0;
+			update = 0;
+			error = 0;
+			absPosition = 0;
+			precision = pow(10, -digits);
+			readCmd[0] = READ_ABS_DATA_CMD; //RESET_SOFTWARE_CMD;
+			state = SEND_COMMAND;
+			break;
+		case SEND_COMMAND:
+			if (delay <= 0) {
+//				rtapi_print("%s Requesting data 0x%02x\n", name, readCmd[0]);
+				delay = REQUEST_PERIOD_NS;
+				hm2_pktuart_send(name, readCmd, &send_num_frames, send_frame_sizes);
+				switch (readCmd[0]) {
+					case RESET_SOFTWARE_CMD:
+						readCmd[0] = READ_ABS_DATA_CMD;
+						break;
+					case READ_ERROR_DETAIL_CMD:
+						readCmd[0] = READ_ABS_DATA_CMD;
+						break;
+					default:
+						readCmd[0] = READ_ABS_DATA_CMD;
+						break;
+				}
+				state = WAITING_FOR_DATA;
+				waitCount = 0;
+			}
+			break;
+		case WAITING_FOR_DATA:
+			update = 0;
+			rxStatus = hm2_pktuart_get_rx_status(name);
+			if (rxStatus & 0x40000033) {
+				error = 1;
+				state = ERROR_RESET;
+				break;
+			}
+			if (rxStatus & 0x00200000) {
+				waitCount = 0;
+				state = WAITING_FOR_DATA_FRAME;
+				break;
+			}
+			waitCount++;
+			if (waitCount > 5000) {
+				rtapi_print_msg(RTAPI_MSG_ERR, "%s Timed-out waiting for data to arrive - retrying\n", name);
+				state = SEND_COMMAND;
+			}
+			break;
+		case WAITING_FOR_DATA_FRAME:
+			rxStatus = hm2_pktuart_get_rx_status(name);
+			if (rxStatus & 0x40000033) {
+			    error = 1;
+				state = ERROR_RESET;
+				break;
+			}
+			if (!(rxStatus & 0x001F0000)) {
+				waitCount++;
+				if (waitCount > 500) {
+				    error = 1;
+					rtapi_print_msg(RTAPI_MSG_ERR, "%s Timed-out waiting for frame data to arrive\n", name);
+					state = ERROR_RESET;
+				}
+				break;
+			}
+			hm2_pktuart_queue_get_frame_sizes(name, frame_sizes);
+			state = FETCH_FRAME_DATA;
+			frame_index = 0;
+			break;
+		case FETCH_FRAME_DATA:
+			// This step will be repeated if there are multiple frames
+			update = 0;
+			hm2_pktuart_queue_read_data(name, rxdata, frame_sizes[frame_index]);
+			state = PARSE_DATA; // Just a one-cycle delay, the data is on the FPGA
+			break;
+		case PARSE_DATA:
+//			rtapi_print("%s Parsing frame data: ", name);
+//			dumpFrameData(rxdata, frame_sizes[frame_index]);
+				
+			if (frame_sizes[frame_index] > 0) {
+			    if (checkSumOk(rxdata, frame_sizes[frame_index])) {
+
+					if ((rxdata[0] & 0x01) != 0) {
+						error = 1;
+						readCmd[0] = READ_ERROR_DETAIL_CMD;
+					}
+					
+					rtapi_u8 cmd = (rxdata[0] & 0xFC) >> 2;
+					
+					switch (cmd) {
+						case 0x00: //Absolute data
+							if (checkForBadFrameSize(rxdata, frame_sizes[frame_index], 6)) {
+								break;
+							}
+							int rawPosition = ((rxdata[1] & 0xFF) << 24) | (rxdata[0] >> 8 & 0x00FFFFFF);
+							float newAbsPosition = precision * round((scaling * rawPosition + offset) / precision);
+							absPosition = newAbsPosition;
+							valid = 1;
+							if (fabs(newAbsPosition - oldAbsPosition) >= changeThreshold) {
+								update = 1;
+								oldAbsPosition = newAbsPosition;
+								rtapi_print("%s absPosition updated to %f\n", name, newAbsPosition);
+							}
+							else {
+								update = 0;
+							}
+							break;
+						case 0x06: //Error detail
+							if (checkForBadFrameSize(rxdata, frame_sizes[frame_index], 6)) {
+								break;
+							}
+							unsigned int rawError = ((rxdata[1] & 0xFF) << 24) | (rxdata[0] >> 8 & 0x00FFFFFF);
+							for (int i=0; i<32; i++) {
+								if (((rawError >> i) & 1) != 0) {
+									switch (i) {
+										case 0:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 MN805 error\n", name);
+											break;
+										case 1:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 EPROM read/write error\n", name);
+											break;
+										case 2:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 FIFO overflow error\n", name);
+											break;
+										case 3:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 CPU error\n", name);
+											break;
+										case 4:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 MN805 diagnostic error\n", name);
+											break;
+										case 5:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 EEPROM address data error\n", name);
+											break;
+										case 6:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Lambda data error\n", name);
+											break;
+										case 7:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 EEPROM checksum error\n", name);
+											break;
+										case 8:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Lambda 0 signal is too low error\n", name);
+											break;
+										case 9:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Lambda 1 signal is too low error\n", name);
+											break;
+										case 10:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Lambda 2 signal is too low error\n", name);
+											break;
+										case 11:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Lambda 0 signal is too high error\n", name);
+											break;
+										case 12:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Lambda 1 signal is too high error\n", name);
+											break;
+										case 13:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Lambda 2 signal is too high error\n", name);
+											break;
+										default:
+											rtapi_print_msg(RTAPI_MSG_ERR, "%s Mitutoyo AT715 Reserved error bit %d is set\n", name, i);
+											break;
+									}
+								}
+							}
+							break;
+						case 0x25: //Software reset
+							break;
+						default:
+							break;
+					}
+					if ((rxdata[0] & 0x01) == 0) {
+						error = 0;
+					}
+			    }
+			    else {
+			        error = 1;
+			    }
+			}
+			frame_index++;
+			if ((frame_index < MAX_FRAMES) & ((frame_sizes[frame_index] & 0x3FF) > 0)){
+				state = FETCH_FRAME_DATA;
+			}
+			else {
+				state = SEND_COMMAND;
+			}
+			break;
+		case ERROR_RESET:
+			valid = 0;
+			update = 0;
+			rtapi_print("Resetting %s due to a receiver error: 0x%08x\n", name, rxStatus);
+			hm2_pktuart_queue_reset(name);
+			delay = REQUEST_PERIOD_NS;
+			state = STARTING;
+			break;
+	}
+	delay = delay - period;
+}
+
+EXTRA_SETUP() { // the names parameters are passed in 'prefix'. You just have to know that.
+	if (prefix[0] == 'm'){ // should be the 'h' of hm2_....
+		rtapi_print_msg(0, "mesa_pktuart_AT715 can not be loaded using the 'count' "
+						"parameter, see man mesa_pktuart_AT715 for details\n");
+		return -1;
+	}
+	name = prefix;
+	
+	rtapi_print("Setting up %s for Mitutoyo AT715\n", name);
+	
+	//Setup transmit for no parity, leave the driver enabled 1 bit time 
+	//for the stop bit, auto enable, and enable the driver 15 clocks 
+	//before the start bit 
+	hm2_pktuart_config_t txcfg = {
+		.baudrate   = BAUDRATE,
+		.filterrate = 0,
+		.drivedelay = 15,
+		.ifdelay    = 1,
+		.flags      = HM2_PKTUART_CONFIG_DRIVEAUTO
+	};
+
+	//Setup receive for double bit rate filter bandwidth, no parity, 
+	//255 bit time frame delay, enable the receiver, and mask the 
+	//receiver on transmit
+	hm2_pktuart_config_t rxcfg = {
+		.baudrate   = BAUDRATE,
+		.filterrate = 2*BAUDRATE,
+		.drivedelay = 0,
+		.ifdelay    = 0xFF,
+		.flags      = HM2_PKTUART_CONFIG_RXEN | HM2_PKTUART_CONFIG_RXMASKEN
+	};
+
+    int retval = hm2_pktuart_config(name, &rxcfg, &txcfg, 1);
+	if (retval < 0)
+	{
+	    rtapi_print_msg(RTAPI_MSG_ERR, "%s PktUART for AT715 setup problem: %d\n", name, retval);
+	    return -1;
+	}
+	
+	hm2_pktuart_queue_reset(name);
+	
+	return 0;
+}
+
+
+int get_count(void) {
+	int i;
+	for (i= 0; pktuart_chans[i] != NULL && i < 2 ; i++){}
+	return i;
+}
+

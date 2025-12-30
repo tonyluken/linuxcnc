@@ -1,0 +1,87 @@
+.\" -*- mode: troff; coding: utf-8 -*-
+.\"*******************************************************************
+.\"
+.\" This file was extracted from hal/components/mesa_pktuart_at715.comp using halcompile.g.
+.\" Modify the source file.
+.\"
+.\"*******************************************************************
+
+.TH MESA_PKTUART_AT715 "9" "2025-12-30" "LinuxCNC Documentation" "HAL Component"
+.SH NAME
+
+mesa_pktuart_at715 \- PktUART interface to Mitutoyo AT715 Absolute Linear Scale
+.SH SYNOPSIS
+.HP
+.B loadrt mesa_pktuart_at715 [count=\fIN\fB|names=\fIname1\fB[,\fIname2...\fB]]
+.SH DESCRIPTION
+
+
+This component uses the Mesa PktUART to interface with a Mitutoyo AT715 Absolute
+Linear Scale. It may work with other models/brands if they follow the same
+protocol: This component sends an absolute mesurement request command to the AT715 every 
+50 ms. The command is simply a single byte (0x01). The AT715 responds to the command
+by sending a 6 byte frame containing the absolute position. The bit rate is 19200 bits
+per second, the bytes are sent with 8N1 encoding (1 start bit, 8 data bits, no
+parity bit, and one stop bit. The first byte in the response is 0x00, the next 4 bytes
+(sent least significant byte first) represent the absolute position with an lsb
+of 0.5um, and the last byte is the sum of the prior 5 bytes.
+
+This component exports four HAL pins: the first, absPosition, is the absolute
+position with the desired scaling and offset applied; the second, valid, is a flag
+indicating the position is valid; the third, update, is a flag indicating the
+position has changed by at least the changeThreshold; and the forth, error, is a flag
+indicating the Mitutoyo AT715 is reporting an error.
+
+Parameters are provided to scale, offset, and round the raw position reported by the AT715
+such that the output position is given by:
+
+	absPosition = precision * round( (scaling * rawPosition + offset) / precision )
+	
+	where precision = pow(10, -digits)
+
+A fourth parameter is provided to set the changeThreshhold.
+
+This module uses the names= mode of loadrt declaration to specifiy which PktUART
+instances to enable. A check is included to ensure that the count= option is
+not used instead. The component should be loaded something like this:
+
+loadrt mesa_pktuart_at715 names=hm2_[MESA](BOARD).0.pktuart.0
+addf hm2_[MESA](BOARD).0.pktuart.0.receive servo-thread
+
+
+.SH FUNCTIONS
+.TP
+\fBmesa-pktuart-at715.\fIN\fB.receive\fR (requires a floating-point thread)
+
+.SH PINS
+.TP
+.B mesa-pktuart-at715.\fIN\fB.valid\fR bit out \fR
+Indicates the absolute position is valid
+.TP
+.B mesa-pktuart-at715.\fIN\fB.update\fR bit out \fR
+Pulses high to indicate the absolute position has changed
+.TP
+.B mesa-pktuart-at715.\fIN\fB.absPosition\fR float out \fR
+The absolute position
+.TP
+.B mesa-pktuart-at715.\fIN\fB.error\fR bit out \fR
+Indicates the Mitutoyo AT715 is reporting an error
+.SH PARAMETERS
+.TP
+.B mesa-pktuart-at715.\fIN\fB.scaling\fR float rw \fR(default: \fI5e-4\fR)
+Signed scale factor to be applied to the raw absolute position, use +/-1.968503937e-5 to obtain inches or +/-5e-4 to obtain millimeters
+.TP
+.B mesa-pktuart-at715.\fIN\fB.offset\fR float rw \fR(default: \fI0.0\fR)
+Offset to be applied to the scaled position
+.TP
+.B mesa-pktuart-at715.\fIN\fB.digits\fR float rw \fR(default: \fI4\fR)
+The number of digits to the right of the decimal point to output
+.TP
+.B mesa-pktuart-at715.\fIN\fB.changeThreshold\fR float rw \fR(default: \fI0.0005\fR)
+Threshold to determine when the scaled position has changed
+.SH AUTHOR
+
+Tony Luken
+.SH LICENSE
+
+GPL
