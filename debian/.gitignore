@@ -16,4 +16,3 @@ linuxcnc-uspace.install
 *.debhelper
 shlibs.local
 linuxcnc-uspace.lintian-overrides
-/linuxcnc-uspace.manpages
