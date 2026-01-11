@@ -45,6 +45,8 @@ import tempfile            # needed only if the user click new in edit mode to o
 import linuxcnc            # to get our own error system
 import locale              # for setting the language of the GUI
 import gettext             # to extract the strings to be translated
+import re
+import string
 from collections import OrderedDict # needed for proper jog button arrangement
 from time import strftime  # needed for the clock in the GUI
 #from Gtk._Gtk import main_quit
@@ -123,7 +125,31 @@ TCLPATH = os.environ['LINUXCNC_TCL_DIR']
 ALERT_ICON = "dialog_warning"
 INFO_ICON = "dialog_information"
 
+# regex that uses named groups for each optional part of string format specifiers
+FORMAT_SPEC_REGEX = re.compile(
+    r"""
+    ((?P<fill>.)?(?P<align>[<>=^]))?                         # Optional fill character and alignment (<, >, =, ^)
+    (?P<sign>[+\- ])?                                        # Optional sign (+, -, space)
+    (?P<z>z)?                                                # Optional 'z' character to coerce negative floating point zeros to positive zeros
+    (?P<hash>\#)?                                            # Optional '#' character for alternate formating
+    (?P<zero>0)?                                             # Optional '0' character (for zero padding)
+    ((?P<width>\d+)?(?P<integralGrouping>[,_])?)?            # Optional width (integer) and integral digit grouping character (comma or underscore)
+    (\.((?P<precision>\d+)?(?P<precisionGrouping>[,_])?))?   # Optional precision (integer) and fractional digit grouping character (comma or underscore)
+    (?P<type>[bcdeEfFgGnosxX%])?                             # Optional type character
+    """,
+    re.VERBOSE
+)
 
+# regex to verify user message parameter names are valid
+FORMAT_NAME_REGEX = re.compile(
+    r"""
+    ^                # The parameter name must begin at the start of the string
+    (?!\d+$)         # The parameter name cannot be entirely composed of decimal digits
+    [a-z0-9\-]+      # The parameter name can only include lower case letters, decimal digits, and hyphens 
+    $                # The parameter name must end at the end of the string
+    """,
+    re.VERBOSE
+)
 
 class gmoccapy(object):
     def __init__(self, argv):
@@ -2274,14 +2300,19 @@ class gmoccapy(object):
         if not user_messages:
             return
         for message in user_messages:
+            msgParams = self._extract_user_message_parameters(message)
             if message[1] == "status":
                 pin = hal_glib.GPin(self.halcomp.newpin("messages." + message[2], hal.HAL_BIT, hal.HAL_IN))
                 pin.connect("value_changed", self._show_user_message, message)
+                for name in msgParams.keys():
+                    pin = hal_glib.GPin(self.halcomp.newpin("messages." + message[2] + "-params.{0:s}".format(name), msgParams[name], hal.HAL_IN))
             elif message[1] == "okdialog":
                 pin = hal_glib.GPin(self.halcomp.newpin("messages." + message[2], hal.HAL_BIT, hal.HAL_IN))
                 pin.connect("value_changed", self._show_user_message, message)
                 pin = hal_glib.GPin(
                     self.halcomp.newpin("messages." + message[2] + "-waiting", hal.HAL_BIT, hal.HAL_OUT))
+                for name in msgParams.keys():
+                    pin = hal_glib.GPin(self.halcomp.newpin("messages." + message[2] + "-params.{0:s}".format(name), msgParams[name], hal.HAL_IN))
             elif message[1] == "yesnodialog":
                 pin = hal_glib.GPin(self.halcomp.newpin("messages." + message[2], hal.HAL_BIT, hal.HAL_IN))
                 pin.connect("value_changed", self._show_user_message, message)
@@ -2289,26 +2320,38 @@ class gmoccapy(object):
                     self.halcomp.newpin("messages." + message[2] + "-waiting", hal.HAL_BIT, hal.HAL_OUT))
                 pin = hal_glib.GPin(
                     self.halcomp.newpin("messages." + message[2] + "-response", hal.HAL_BIT, hal.HAL_OUT))
+                for name in msgParams.keys():
+                    pin = hal_glib.GPin(self.halcomp.newpin("messages." + message[2] + "-params.{0:s}".format(name), msgParams[name], hal.HAL_IN))
             else:
                 LOG.error(_("Message type {0} not supported").format(message[1]))
 
     def _show_user_message(self, pin, message):
+        msgParams = self._extract_user_message_parameters(message)
+        paramDict = dict()
+        for name in msgParams.keys():
+            value = self.halcomp["messages." + message[2] + "-params.{0:s}".format(name)]
+            if msgParams.get(name) == hal.HAL_BIT:
+                if value:
+                    value = "True"
+                else:
+                    value = "False"
+            paramDict[name] = value
         if message[1] == "status":
             if pin.get():
-                self._show_error((0, message[0]))
+                self._show_error((0, message[0].format(**paramDict)))
         elif message[1] == "okdialog":
             self.halcomp["messages." + message[2] + "-waiting"] = 0
             if pin.get():
                 self.halcomp["messages." + message[2] + "-waiting"] = 1
                 title = "Pin " + message[2] + " message"
-                response = self.dialogs.show_user_message(self, message[0], title)
+                response = self.dialogs.show_user_message(self, message[0].format(**paramDict), title)
                 self.halcomp["messages." + message[2] + "-waiting"] = 0
         elif message[1] == "yesnodialog":
             if pin.get():
                 self.halcomp["messages." + message[2] + "-waiting"] = 1
                 self.halcomp["messages." + message[2] + "-response"] = 0
                 title = "Pin " + message[2] + " message"
-                response = self.dialogs.yesno_dialog(self, message[0], title)
+                response = self.dialogs.yesno_dialog(self, message[0].format(**paramDict), title)
                 self.halcomp["messages." + message[2] + "-waiting"] = 0
                 self.halcomp["messages." + message[2] + "-response"] = response
             else:
@@ -2316,6 +2359,52 @@ class gmoccapy(object):
         else:
             LOG.error(_("Message type {0} not supported").format(message[1]))
 
+    def _extract_user_message_parameters(self, message):
+        formats = string.Formatter().parse(message[0])
+        msgdict = dict()
+        for text, name, spec, conv in formats:
+            if name is not None:
+                match = FORMAT_NAME_REGEX.fullmatch(name)
+                if match is None:
+                    LOG.error(_("Invalid user message parameter name '{0:s}'. Valid names must consist only of lower case letters, decimal digits, and hyphens. In addition, they must contain at least one letter or hyphen (they cannot be entirely numeric). Found in user message: '{1:s}'").format(name, message[0]))
+                    return {}
+                hal_pin_type = self._get_user_message_parameter_hal_pin_type(spec)
+                if hal_pin_type is None:
+                    LOG.error(_("Unsuported or invalid format specifier {{{0:s}:{1:s}}} found in user message: '{2:s}'").format(name, spec, message[0]))
+                    return {}
+                current_pin_type = msgdict.get(name)
+                if current_pin_type is not None:
+                    if current_pin_type != hal_pin_type:
+                        LOG.error(_("Conflicting hal pin types for parameter named '{0:s}' in user message: '{1:s}'").format(name, message[0]))
+                        return {}
+                else:
+                    msgdict[name] = hal_pin_type
+            else:
+                if spec is not None:
+                    LOG.error(_("Replacement field {{{0:s}}} must have a valid name in user message: '{1:s}'").format(spec, message[0]))
+                    return {}
+        return msgdict
+        
+    def _get_user_message_parameter_hal_pin_type(self, spec):
+        match = FORMAT_SPEC_REGEX.fullmatch(spec)
+        if match:
+            matchdict = match.groupdict()
+            #available dictionary keys:(fill, align, sign, z, hash, zero, width, integralGrouping, precision, precisionGrouping, type)
+            typ = matchdict.get("type")
+            sign = matchdict.get("sign")
+            if typ:
+                if typ in "s":             #string formatting is used for HAL_BIT pins (will display as True or False)
+                   return hal.HAL_BIT
+                if typ in "bcdoxX":        #integer formating (except n) is used for HAL_U32 and HAL_S32 pins
+                    if sign:               #if a sign was specifed (either +, - or space), then a HAL_S32 pin will be used. Otherwise, a HAL_U32 pin.
+                        return hal.HAL_S32
+                    else:
+                        return hal.HAL_U32
+                if typ in "eEfFgGn%":      #all other numeric formatting is used for HAL_FLOAT pins
+                    # floating point types
+                    return hal.HAL_FLOAT
+        return None
+		    
     def _show_offset_tab(self, state):
         page = self.widgets.ntb_preview.get_nth_page(1)
         if page.get_visible() and state or not page.get_visible() and not state:

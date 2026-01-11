@@ -388,6 +388,20 @@ MESSAGE_PINNAME = is the name of the HAL pin group to be created
 The messages support pango markup language. Detailed information about the markup language can be found at
 https://developer.gnome.org/pango/stable/PangoMarkupFormat.html[Pango Markup].
 
+==== Message Text Replacement Fields
+The message text may also include "replacement fields" enclosed by curly braces {} which get replaced by the value of HAL pins captured just before the message is displayed. See the forth message example below to see how this is done. Each "replacement field" consists of a HAL pin name followed by a colon ':' character followed by a Python style format specifier: {__pin_name__:__format_specifier__}. Pin names are resticted to using only lower case letters, decimal digits, and hyphens '-'. In addition, at least one letter or hyphen must be present in the pin name. For each unique _pin_name_ appearing in the message text, a `-params.pin_name` HAL input pin is provided for the message.
+
+The _format_specifier_ controls not only how the value is displayed (decimal, binary, hexadecimal, precision, alignment, etc.) but also the type of HAL input pin (HAL_BIT, HAL_S32, or HAL_U32).
+
+Format specifier type 's', results in HAL_BIT input pins and the replacement value will be displayed as the string "True" or "False" depending on the state of the input pin.
+
+Format specifier types 'b', 'c', 'd', 'o', 'x', or 'X' result in either a HAL_S32 input pins (if the _format_specifier_ contains a sign option: plus '+', minus '-', or space ' ' character) or a HAL_U32 input pins (if the _format_specifier_ does not contain a sign option).
+
+Format specifier types 'e', 'E', 'f', 'F', 'g', 'G', 'n' or '%' result in a HAL_FLOAT input pins.
+
+See the Python https://docs.python.org/3/library/string.html#format-specification-mini-language[Format Specification Mini-Language] for more details on the meaning of each of the format specifier types and the options available for controlling the formatting of the values. 
+
+==== Dialog Types
 The following three dialog types are available:
 
 * *status* - Will just display a message as pop up window, using the messaging system of GMOCCAPY.
@@ -410,10 +424,14 @@ MESSAGE_PINNAME = yesnodialog
 MESSAGE_TEXT = Text can be <small>small</small>, <big>big</big>, <b>bold</b <i>italic</i>, and even be <span color="red">colored</span>.
 MESSAGE_TYPE = okdialog
 MESSAGE_PINNAME = okdialog
+
+MESSAGE_TEXT = The state of pin0 is {pin0:s}. Hexidecimal value of pin1 is {pin1:#010x}, its binary value is {pin1:039_b}, and its decimal value is {pin1:d}. Decimal value of pin2 is {pin2:-d}. The xyz coordinates are [{x:+8.4f}, {y:+8.4f}, {z:+8.4f}].
+MESSAGE_TYPE = okdialog
+MESSAGE_PINNAME = demo1
 ----
 
 [NOTE]
-Currently the formatting doesn't work.
+Currently the Pango Markup formatting doesn't work.
 
 === Preview Control
 
@@ -821,23 +839,25 @@ Messages or user infos will not affect the `gmoccapy.error` pin, but the `gmocca
 [[gmoccapy:user-created-message]]
 === User Created Message HAL Pins
 
-GMOCCAPY may be configured to react to external errors, using 3 different user messages:
+GMOCCAPY may be configured to display user status messages and dialog boxes based on HAL signals. There are three different user message types as shown below. Each has a different number of HAL pins:
 
 .status
 
-- *gmoccapy.messages.status* _(bit IN)_ - Triggers the dialog.
+- *gmoccapy.messages.<MESSAGE_PINNAME>* _(bit IN)_ - Triggers the status message.
 
 .okdialog
 
-- *gmoccapy.messages.okdialog* _(bit IN)_ - Triggers the dialog.
-- *gmoccapy.messages.okdialog-waiting* _(bit OUT)_ - Will be '1' as long as the dialog is open. Closing the message will reset the this pin.
+- *gmoccapy.messages.<MESSAGE_PINNAME>* _(bit IN)_ - Triggers the dialog.
+- *gmoccapy.messages.<MESSAGE_PINNAME>-waiting* _(bit OUT)_ - Will be '1' as long as the dialog is open. Closing the message will reset the this pin.
 
 .yesnodialog
 
-- *gmoccapy.messages.yesnodialog* _(bit IN)_ - Triggers the dialog.
-- *gmoccapy.messages.yesnodialog-waiting* _(bit OUT)_ - Will be '1' as long as the dialog is open. Closing the message will reset the this pin.
-- *gmoccapy.messages.yesnodialog-response* _(bit OUT)_ - This pin will change to '1' if the user clicks OK and in all other cases it will be '0'.
-  This pin will remain '1' until the dialog is called again.
+- *gmoccapy.messages.<MESSAGE_PINNAME>* _(bit IN)_ - Triggers the dialog.
+- *gmoccapy.messages.<MESSAGE_PINNAME>-waiting* _(bit OUT)_ - Will be '1' as long as the dialog is open. Closing the message will reset the this pin.
+- *gmoccapy.messages.<MESSAGE_PINNAME>-response* _(bit OUT)_ - This pin will change to '1' if the user clicks OK and in all other cases it will be '0'.
+  This pin will retain its state until the dialog is called again.
+
+In addition to the pins mentioned above, GMOCCAPY will supply input pins for each pin named in "replacement text" fields contained within the message text. These will be named *gmoccapy.messages.<MESSAGE_PINNAME>-params.<pin_name>*
 
 To add a user created message you need to add the message to the INI file in the DISPLAY section.
 See <<sub:gmocccapy-configuration-user-messages,Configuration of User Created Messages>>.
@@ -852,6 +872,10 @@ MESSAGE_PINNAME = lube-fault
 MESSAGE_TEXT = X SHEAR PIN BROKEN
 MESSAGE_TYPE = status
 MESSAGE_PINNAME = pin
+
+MESSAGE_TEXT = The xyz coordinates are: [{x:+6.4f}, {y:+6.4f}, {z:+6.4f}], are they good enough?
+MESSAGE_TYPE = yesnodialog
+MESSAGE_PINNAME = coords-dialog
 ----
 
 To connect these new pins you need to do this in the postgui HAL file.
@@ -860,9 +884,17 @@ Here are some example connections which connect the message signals to some plac
 .Example Connection of User Messages (HAL file)
 [source,{hal}]
 ----
-net gmoccapy-lube-fault gmoccapy.messages.lube-fault
-net gmoccapy-lube-fault-waiting gmoccapy.messages.lube-fault-waiting
-net gmoccapy-pin gmoccapy.messages.pin
+net gmoccapy-lube-fault           gmoccapy.messages.lube-fault
+net gmoccapy-lube-fault-waiting   gmoccapy.messages.lube-fault-waiting
+
+net gmoccapy-pin                  gmoccapy.messages.pin
+
+net verify-coords-dialog          gmoccapy.messages.coords-dialog
+net verify-coords-dialog-waiting  gmoccapy.messages.coords-dialog-waiting
+net verify-coords-dialog-response gmoccapy.messages.coords-dialog-response
+net x-coordinate                  gmoccapy.messages.coords-dialog-params.x
+net y-coordinate                  gmoccapy.messages.coords-dialog-params.y
+net z-coordinate                  gmoccapy.messages.coords-dialog-params.z
 ----
 
 For more information about HAL files and the net command see the
